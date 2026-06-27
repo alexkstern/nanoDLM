@@ -38,6 +38,14 @@ COMMON_MODEL=(--data-dir "$DATADIR" --max-steps "$MAXSTEPS" --device "$DEVICE" \
               --n-layer "$NLAYER" --n-embd "$NEMBD" --n-head "$NHEAD" \
               --block-size "$BLOCK" --batch-size "$BATCH" $EXTRA)
 
+# Fail fast if cuda was requested but torch can't see a GPU (e.g. a +cpu torch
+# build on a GPU box) — otherwise the run silently grinds on CPU for hours.
+if [ "$DEVICE" = "cuda" ] && ! python -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)"; then
+  echo "ERROR: DEVICE=cuda but torch.cuda.is_available()==False (torch=$(python -c 'import torch;print(torch.__version__)'))."
+  echo "  -> install a CUDA torch build, or pass DEVICE=cpu to intentionally run on CPU."
+  exit 1
+fi
+
 echo "=== [1/3] prepare $DATASET (gpt2 BPE) -> $DATADIR ==="
 python prepare.py --dataset "$DATASET" --tokenizer gpt2 --data-dir "$DATADIR"
 

@@ -30,4 +30,9 @@ else
     echo "env: uv pip install -r requirements.txt (into $VIRTUAL_ENV)"
     uv pip install --python "$VIRTUAL_ENV/bin/python" -r requirements.txt
 fi
-echo "env: python = $(command -v python)   torch = $(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo MISSING)"
+echo "env: python = $(command -v python)   torch = $(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo MISSING)   cuda = $(python -c 'import torch; print(torch.cuda.is_available())' 2>/dev/null || echo '?')"
+# Loud warning: CPU-only torch while an NVIDIA GPU is actually attached.
+if command -v nvidia-smi >/dev/null 2>&1 && ! python -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+    echo "env: WARNING — a GPU is present (nvidia-smi) but torch.cuda.is_available() is False."
+    echo "env:           you likely have a +cpu torch build; install a CUDA wheel or training will use CPU."
+fi
