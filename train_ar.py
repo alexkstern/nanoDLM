@@ -11,6 +11,7 @@ differences:
 
 Output: out/ckpt_ar.pt — picked up by eval.py for the head-to-head table.
 """
+import argparse
 import math
 import os
 import pickle
@@ -24,6 +25,31 @@ from config import Config
 from model_ar import ARLM
 
 cfg = Config()
+
+# --- CLI overrides (mirror train.py, minus the schedule flags) ---------------
+_p = argparse.ArgumentParser(description="Train the autoregressive baseline.")
+_p.add_argument("--seed", type=int, default=cfg.seed)
+_p.add_argument("--max-steps", type=int, default=cfg.max_steps)
+_p.add_argument("--out-dir", default=cfg.out_dir)
+_p.add_argument("--data-dir", default=cfg.data_dir)
+_p.add_argument("--batch-size", type=int, default=cfg.batch_size)
+_p.add_argument("--block-size", type=int, default=cfg.block_size)
+_p.add_argument("--n-layer", type=int, default=cfg.n_layer)
+_p.add_argument("--n-head", type=int, default=cfg.n_head)
+_p.add_argument("--n-embd", type=int, default=cfg.n_embd)
+_p.add_argument("--lr", type=float, default=cfg.lr)
+_p.add_argument("--eval-interval", type=int, default=cfg.eval_interval)
+_p.add_argument("--sample-interval", type=int, default=cfg.sample_interval)
+_p.add_argument("--device", default=cfg.device)
+_p.add_argument("--no-compile", action="store_true", help="disable torch.compile")
+_args = _p.parse_args()
+for _k, _v in vars(_args).items():
+    if _k == "no_compile":
+        continue
+    setattr(cfg, _k, _v)
+if _args.no_compile:
+    cfg.compile = False
+
 torch.manual_seed(cfg.seed)
 os.makedirs(cfg.out_dir, exist_ok=True)
 

@@ -6,6 +6,7 @@ predict the masked tokens, and weight the cross-entropy by 1/t.
 
 Everything else is standard nanoGPT-style scaffolding.
 """
+import argparse
 import math
 import os
 import pickle
@@ -18,8 +19,46 @@ import torch
 from config import Config
 from model import DLM
 from sample import generate
+from schedule import resolve_exponents, summarize, survival_and_weight
 
 cfg = Config()
+
+# --- CLI overrides -----------------------------------------------------------
+# train.py runs as a flat script (Config() with no overrides). For sweeping the
+# schedule / seed / scale from a shell driver we expose a thin argparse layer;
+# anything not passed keeps its config.py default.
+_p = argparse.ArgumentParser(description="Train a masked-diffusion LM (nanoDLM).")
+_p.add_argument("--schedule", choices=["uniform", "rare_first", "frequent_first"],
+                default=cfg.schedule, help="frequency-weighted masking schedule")
+_p.add_argument("--zipf-beta", type=float, default=cfg.zipf_beta,
+                help="schedule strength; 0 collapses to uniform")
+_p.add_argument("--const-exp", type=float, default=cfg.const_exp,
+                help="fixed exponent for every token (frequency-independent control)")
+_p.add_argument("--match-noise", default=cfg.match_noise,
+                choices=["", "rare_first", "frequent_first"],
+                help="constant-exponent control matched to this arm's mean noise")
+_p.add_argument("--seed", type=int, default=cfg.seed)
+_p.add_argument("--max-steps", type=int, default=cfg.max_steps)
+_p.add_argument("--out-dir", default=cfg.out_dir)
+_p.add_argument("--data-dir", default=cfg.data_dir)
+_p.add_argument("--batch-size", type=int, default=cfg.batch_size)
+_p.add_argument("--block-size", type=int, default=cfg.block_size)
+_p.add_argument("--n-layer", type=int, default=cfg.n_layer)
+_p.add_argument("--n-head", type=int, default=cfg.n_head)
+_p.add_argument("--n-embd", type=int, default=cfg.n_embd)
+_p.add_argument("--lr", type=float, default=cfg.lr)
+_p.add_argument("--eval-interval", type=int, default=cfg.eval_interval)
+_p.add_argument("--sample-interval", type=int, default=cfg.sample_interval)
+_p.add_argument("--device", default=cfg.device)
+_p.add_argument("--no-compile", action="store_true", help="disable torch.compile")
+_args = _p.parse_args()
+for _k, _v in vars(_args).items():
+    if _k == "no_compile":
+        continue
+    setattr(cfg, _k, _v)
+if _args.no_compile:
+    cfg.compile = False
+
 torch.manual_seed(cfg.seed)
 os.makedirs(cfg.out_dir, exist_ok=True)
 
@@ -43,6 +82,19 @@ print(f"vocab size: {cfg.vocab_size} (+1 [MASK])")
 
 train_data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=np.uint16, mode="r")
 val_data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=np.uint16, mode="r")
+
+# Per-token-identity exponents for the frequency-weighted schedule (schedule.py).
+# resolve_exponents applies the precedence (match_noise > const_exp > schedule)
+# and returns None for the uniform / beta==0 baseline so loss_fn takes the
+# byte-identical vanilla-MDLM code path.
+_exp_np, _label, _counts, _ranks = resolve_exponents(
+    cfg, os.path.join(data_dir, "train.bin"))
+print(f"schedule: {_label}")
+if _exp_np is not None:
+    print(summarize(_exp_np, _counts, _ranks, itos))
+    loss_exponents = torch.from_numpy(_exp_np).to(device)   # (vocab_size,)
+else:
+    loss_exponents = None
 
 
 def get_batch(split):
@@ -69,7 +121,8 @@ if cfg.compile and device == "cuda":
         print("triton not installed; skipping torch.compile (training will run, just slower)")
 
 
-def loss_fn(model, x, self_cond_prob: float = 0.5, p_ar_mix: float = 0.25):
+def loss_fn(model, x, self_cond_prob: float = 0.5, p_ar_mix: float = 0.0,
+            exponents=None):
     """The whole pedagogical payload of nanoDLM.
 
     Self-conditioning (Chen et al. 2023): with probability self_cond_prob,
@@ -85,6 +138,14 @@ def loss_fn(model, x, self_cond_prob: float = 0.5, p_ar_mix: float = 0.25):
     x[:k]). Same 1/t-weighted CE loss is applied — only the mask shape
     differs. Set p_ar_mix=0 to recover the pure-MDM training of LLaDA /
     MDLM / MD4. Set p_ar_mix=1 to train a pure AR with this codebase.
+
+    Frequency-weighted schedule: if `exponents` is given (a (vocab,) tensor of
+    per-token-identity exponents c_i from schedule.py), each token is masked
+    with prob 1 - (1-t)**c_i instead of the uniform t, and weighted by the
+    matching per-token absorbing-state ELBO weight
+        w_i(t) = c_i * (1-t)**(c_i - 1) / (1 - (1-t)**c_i),
+    which reduces to 1/t when c_i = 1. exponents=None takes the exact
+    vanilla-MDLM path so the uniform baseline is bit-for-bit unchanged.
     """
     B, T = x.shape
 
@@ -96,10 +157,22 @@ def loss_fn(model, x, self_cond_prob: float = 0.5, p_ar_mix: float = 0.25):
         positions = torch.arange(T, device=x.device)[None, :]
         mask = positions >= pivot                                 # (B, T) bool
         t = mask.float().mean(dim=-1, keepdim=True).clamp(min=cfg.eps)
-    else:
-        # Standard absorbing-state MDM noising.
+        weight = (1.0 / t).expand(B, T)
+    elif exponents is None:
+        # Standard absorbing-state MDM noising: every token masked w.p. t.
         t = torch.rand(B, 1, device=x.device).clamp(min=cfg.eps)
         mask = torch.rand(B, T, device=x.device) < t
+        weight = (1.0 / t).expand(B, T)
+    else:
+        # Frequency-weighted noising. survival_i = (1-t)**c_i, so the per-token
+        # mask prob is 1 - (1-t)**c_i and the per-token ELBO weight is
+        # c_i*(1-t)**(c_i-1)/(1-(1-t)**c_i). Clamp t away from BOTH ends: the
+        # lower clamp is the usual 1/t guard; the upper clamp bounds the
+        # (1-t)**(c_i-1) factor when c_i < 1 (frequent tokens at high noise).
+        t = torch.rand(B, 1, device=x.device).clamp(cfg.eps, 1.0 - cfg.eps_hi)
+        c = exponents[x]                                          # (B, T)
+        surv, weight = survival_and_weight(t, c)                  # both (B, T)
+        mask = torch.rand(B, T, device=x.device) < (1.0 - surv)
 
     x_t = torch.where(mask, MASK_ID, x)                           # corrupt
 
@@ -122,7 +195,7 @@ def loss_fn(model, x, self_cond_prob: float = 0.5, p_ar_mix: float = 0.25):
     # heavily-masked siblings in the same batch, and per-batch gradient scale
     # depends on the random mask draw. The proper estimator below is the
     # standard MDM-NELBO and converges to nats/char.
-    return (loss_tok * mask / t).sum() / (B * T)
+    return (loss_tok * mask * weight).sum() / (B * T)
 
 
 @torch.no_grad()
@@ -188,10 +261,20 @@ for step in range(cfg.max_steps + 1):
 
     x = get_batch("train")
     with ctx:
-        loss = loss_fn(model, x, p_ar_mix=cfg.p_ar_mix)
+        loss = loss_fn(model, x, p_ar_mix=cfg.p_ar_mix, exponents=loss_exponents)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
 
-print(f"best val: {best_val:.3f} (checkpoint saved to {ckpt_path})")
+# Also save the FINAL-step checkpoint, selection-free. For the schedule study we
+# eval this one: best-val selection uses the uniform-ELBO criterion, which is the
+# uniform arm's own training objective and would hand it a home-field advantage
+# (and the non-uniform arms an off-objective stopping rule). ckpt_last.pt is the
+# same fixed criterion for every arm. ckpt.pt (best-val) is kept for parity with
+# the upstream repo / AR baseline.
+m = model._orig_mod if hasattr(model, "_orig_mod") else model
+last_path = os.path.join(cfg.out_dir, "ckpt_last.pt")
+torch.save({"model": m.state_dict(), "config": cfg.__dict__,
+            "step": cfg.max_steps, "val": best_val}, last_path)
+print(f"best val: {best_val:.3f} (best -> {ckpt_path}, final -> {last_path})")

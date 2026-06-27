@@ -46,6 +46,12 @@ from model import DLM
 from model_ar import ARLM
 from sample import generate, generate_blockwise
 
+# Resolve the compute device once. On a CUDA box this is "cuda" (identical to
+# the original hardcoded behaviour); off-CUDA it falls back to CPU so the eval
+# harness can be dry-run locally. MPS is skipped here because a couple of the
+# metric ops (kthvalue / multinomial paths) are flaky on it.
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 def load_mdm(ckpt_path: str, device: str):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -73,8 +79,8 @@ def ar_val_nll(model, val_data: np.ndarray, cfg: Config, n_batches: int = 100) -
     losses = []
     for _ in range(n_batches):
         ix = torch.randint(len(val_data) - cfg.block_size - 1, (cfg.batch_size,))
-        x = torch.stack([torch.from_numpy(val_data[i:i+cfg.block_size].astype(np.int64)) for i in ix]).cuda()
-        y = torch.stack([torch.from_numpy(val_data[i+1:i+1+cfg.block_size].astype(np.int64)) for i in ix]).cuda()
+        x = torch.stack([torch.from_numpy(val_data[i:i+cfg.block_size].astype(np.int64)) for i in ix]).to(DEVICE)
+        y = torch.stack([torch.from_numpy(val_data[i+1:i+1+cfg.block_size].astype(np.int64)) for i in ix]).to(DEVICE)
         _, loss = model(x, y)
         losses.append(loss.item())
     return float(np.mean(losses))
@@ -88,7 +94,7 @@ def mdm_val_elbo(model, val_data: np.ndarray, cfg: Config, eps: float = 1e-3,
     losses = []
     for _ in range(n_batches):
         ix = torch.randint(len(val_data) - cfg.block_size, (cfg.batch_size,))
-        x = torch.stack([torch.from_numpy(val_data[i:i+cfg.block_size].astype(np.int64)) for i in ix]).cuda()
+        x = torch.stack([torch.from_numpy(val_data[i:i+cfg.block_size].astype(np.int64)) for i in ix]).to(DEVICE)
         B, T = x.shape
         t = torch.rand(B, 1, device=x.device).clamp(min=eps)
         mask = torch.rand(B, T, device=x.device) < t
@@ -104,12 +110,43 @@ def mdm_val_elbo(model, val_data: np.ndarray, cfg: Config, eps: float = 1e-3,
 
 
 @torch.no_grad()
+def mdm_val_elbo_own(model, val_data: np.ndarray, cfg: Config, exponents,
+                     eps: float = 1e-3, eps_hi: float = 1e-4,
+                     n_batches: int = 100) -> float:
+    """Own-schedule ELBO: the bound under the arm's OWN per-token masking, the
+    tightest self-consistent NLL bound for a non-uniformly-trained model. With
+    exponents=None this equals the uniform ELBO. Compared against the common
+    uniform ELBO it separates a true-NLL gap from mere bound-looseness."""
+    if exponents is None:
+        return mdm_val_elbo(model, val_data, cfg, eps=eps, n_batches=n_batches)
+    from schedule import survival_and_weight
+    MASK_ID = model.mask_id
+    c_full = torch.from_numpy(exponents).to(DEVICE)
+    losses = []
+    for _ in range(n_batches):
+        ix = torch.randint(len(val_data) - cfg.block_size, (cfg.batch_size,))
+        x = torch.stack([torch.from_numpy(val_data[i:i+cfg.block_size].astype(np.int64)) for i in ix]).to(DEVICE)
+        B, T = x.shape
+        t = torch.rand(B, 1, device=x.device).clamp(eps, 1.0 - eps_hi)
+        c = c_full[x]
+        surv, weight = survival_and_weight(t, c)
+        mask = torch.rand(B, T, device=x.device) < (1.0 - surv)
+        x_t = torch.where(mask, MASK_ID, x)
+        logits = model(x_t)
+        loss_tok = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)), x.reshape(-1),
+            reduction="none").view(B, T)
+        losses.append(((loss_tok * mask * weight).sum() / (B * T)).item())
+    return float(np.mean(losses))
+
+
+@torch.no_grad()
 def score_with_ar(ar_model, text_ids: torch.Tensor, cfg: Config) -> float:
     """Per-char NLL of `text_ids` under the AR model. Lower = more on-distribution."""
     if text_ids.size(1) < 2:
         return float("nan")
-    x = text_ids[:, :-1].cuda()
-    y = text_ids[:, 1:].cuda()
+    x = text_ids[:, :-1].to(DEVICE)
+    y = text_ids[:, 1:].to(DEVICE)
     _, loss = ar_model(x, y)
     return float(loss.item())
 
@@ -124,13 +161,13 @@ def sample_ppl_under_ar(model, ar_model, cfg: Config, n_samples: int = 16,
     if is_mdm:
         for _ in range(n_samples):
             out = generate(model, length=length, steps=steps, temperature=temperature,
-                           top_p=top_p, schedule=schedule, device="cuda")
+                           top_p=top_p, schedule=schedule, device=DEVICE)
             all_ids.append(out)
     else:
         # AR sampling
         ar = model
         for _ in range(n_samples):
-            x = torch.tensor([[0]], dtype=torch.long, device="cuda")  # prompt = '\n'
+            x = torch.tensor([[0]], dtype=torch.long, device=DEVICE)  # prompt = '\n'
             for _ in range(length - 1):
                 idx_cond = x[:, -cfg.block_size:]
                 logits = ar(idx_cond)[:, -1, :] / temperature
@@ -173,9 +210,9 @@ def diversity(model, cfg: Config, n_samples: int = 16, length: int = 256, steps:
     for _ in range(n_samples):
         if is_mdm:
             out = generate(model, length=length, steps=steps, temperature=temperature,
-                           top_p=top_p, device="cuda")
+                           top_p=top_p, device=DEVICE)
         else:
-            x = torch.tensor([[0]], dtype=torch.long, device="cuda")
+            x = torch.tensor([[0]], dtype=torch.long, device=DEVICE)
             for _ in range(length - 1):
                 idx_cond = x[:, -cfg.block_size:]
                 logits = model(idx_cond)[:, -1, :] / temperature
@@ -203,14 +240,14 @@ def infill_recovery(model, val_data: np.ndarray, cfg: Config, n_trials: int = 32
     recoveries = []
     for _ in range(n_trials):
         i = int(torch.randint(0, len(val_data) - total_len, ()).item())
-        gold = torch.from_numpy(val_data[i:i+total_len].astype(np.int64)).cuda()
+        gold = torch.from_numpy(val_data[i:i+total_len].astype(np.int64)).to(DEVICE)
         x_init = gold.clone()
         # Mask a span in the middle
         start = (total_len - span_len) // 2
         x_init[start:start+span_len] = model.mask_id
         x_init = x_init[None]                         # (1, total_len)
         out = generate(model, x_init=x_init, steps=steps, temperature=temperature,
-                       top_p=top_p, device="cuda")
+                       top_p=top_p, device=DEVICE)
         recovered = (out[0, start:start+span_len] == gold[start:start+span_len]).float().mean().item()
         recoveries.append(recovered)
     return float(np.mean(recoveries))
@@ -235,7 +272,7 @@ def main():
 
     torch.manual_seed(args.seed)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = DEVICE
     for path in (args.mdm_ckpt, args.ar_ckpt):
         if not os.path.exists(path):
             raise SystemExit(f"missing checkpoint: {path}. "
@@ -250,9 +287,19 @@ def main():
     data_dir = os.path.join(os.path.dirname(__file__), mdm_cfg.data_dir)
     val_data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=np.uint16, mode="r")
 
-    print("\n[1/5] val NLL / ELBO ...")
+    print("\n[1/5] val NLL / ELBO (uniform common bound + own-schedule) ...")
     mdm_elbo = mdm_val_elbo(mdm, val_data, mdm_cfg, eps=mdm_cfg.eps, n_batches=args.n_batches)
     ar_nll = ar_val_nll(ar, val_data, ar_cfg, n_batches=args.n_batches)
+    # Own-schedule ELBO: rebuild this arm's exponents from its training corpus
+    # (same precedence as train.py) and bound under its own masking. Equals the
+    # uniform ELBO for the uniform arm.
+    from schedule import resolve_exponents
+    _own_exp, _own_label, _, _ = resolve_exponents(
+        mdm_cfg, os.path.join(data_dir, "train.bin"))
+    mdm_elbo_own = mdm_val_elbo_own(
+        mdm, val_data, mdm_cfg, _own_exp, eps=mdm_cfg.eps,
+        eps_hi=getattr(mdm_cfg, "eps_hi", 1e-4), n_batches=args.n_batches)
+    print(f"    uniform-ELBO={mdm_elbo:.3f}   own-ELBO[{_own_label}]={mdm_elbo_own:.3f}")
 
     print("[2/5] sample PPL-under-AR (MDM samples, schedule sweep) ...")
     mdm_ppl_by_sched = {}
@@ -295,7 +342,7 @@ def main():
             out = generate_blockwise(mdm, length=args.length,
                                      block_len=block_len,
                                      steps_per_block=sub_steps,
-                                     device="cuda", temperature=args.temperature,
+                                     device=DEVICE, temperature=args.temperature,
                                      top_p=args.top_p)
             nll = score_with_ar(ar, out, mdm_cfg)
             if not np.isnan(nll):
@@ -308,12 +355,15 @@ def main():
 
     # ----- render headline table -----
     rows = [
-        ("Val char NLL (lower better)",
-         f"<= {mdm_elbo:.3f} (ELBO)",
-         f"{ar_nll:.3f}"),
-        (f"Sample PPL under AR scorer @ NFE={args.steps} (lower = more on-distribution)",
+        ("Sample PPL under AR scorer (PRIMARY, schedule-independent, lower better)",
          f"{mdm_ppl:.2f}",
          f"{ar_ppl:.2f}"),
+        ("Val char NLL uniform-ELBO (common bound; favors uniform arm)",
+         f"<= {mdm_elbo:.3f} (ELBO)",
+         f"{ar_nll:.3f}"),
+        ("Val char NLL own-schedule ELBO (each arm's own bound)",
+         f"<= {mdm_elbo_own:.3f} (ELBO)",
+         "N/A"),
         ("Sample distinct-2 (higher = more diverse)",
          f"{mdm_d2:.3f}", f"{ar_d2:.3f}"),
         ("Sample distinct-3",
@@ -326,9 +376,10 @@ def main():
     table += [f"| {m} | {a} | {b} |" for (m, a, b) in rows]
     md = "\n".join(table)
 
-    # ----- schedule-sweep table -----
+    # ----- inference-schedule sweep table (the SAMPLER's commit schedule on a
+    # single checkpoint — NOT the training/masking Zipf schedule) -----
     best = min(mdm_ppl_by_sched, key=mdm_ppl_by_sched.get)
-    sched_rows = ["| Schedule | PPL under AR | delta vs linear |", "|---|---|---|"]
+    sched_rows = ["| Inference (denoising) schedule | PPL under AR | delta vs linear |", "|---|---|---|"]
     base = mdm_ppl_by_sched["linear"]
     for s in ("linear", "cosine", "cosine_inv"):
         ppl = mdm_ppl_by_sched[s]
@@ -358,7 +409,7 @@ def main():
     with open(args.out, "w", encoding="utf-8") as f:
         f.write("# nanoDLM eval: MDM vs AR\n\n")
         f.write(md + "\n\n")
-        f.write("## MDM schedule sweep (PPL under AR scorer)\n\n")
+        f.write("## MDM inference (denoising) schedule sweep (PPL under AR scorer)\n\n")
         f.write(sched_md + "\n\n")
         f.write("## MDM block-wise sampling sweep (Mercury-style semi-AR)\n\n")
         f.write(bw_md + "\n")

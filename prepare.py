@@ -11,11 +11,11 @@ Two datasets:
                          streamed from the start of the file, which gives
                          ~50K short stories. Pass --max-bytes to change.
 
-Note on BPE: we deliberately stay char-level. Switching to GPT-2 BPE
-(~50K vocab) would inflate the embedding table to ~19M params, making
-the model ~30M params total and breaking the "tiny" identity. At this
-scale char-level + a slightly larger sequence window is the right
-trade.
+Note on BPE: char-level is the default. `--tokenizer gpt2` switches to GPT-2
+BPE (~50K vocab), which inflates the embedding table to ~19M params (~30M
+total) but gives a genuine Zipfian *subword* vocabulary — the right granularity
+for testing a token-frequency masking schedule against the "content-word"
+story. We use it for a single robustness run on top of the char-level sweep.
 
 Output:
   data/train.bin, data/val.bin   (uint16 token ids, 90/10 split)
@@ -88,14 +88,25 @@ def main():
                    choices=["shakespeare", "tinystories"])
     p.add_argument("--max-bytes", type=int, default=50 * 1024 * 1024,
                    help="byte cap for streaming TinyStories (default 50 MB)")
+    p.add_argument("--tokenizer", default="char", choices=["char", "gpt2"],
+                   help="char (default) or gpt2 BPE (needs tiktoken). BPE gives "
+                        "a real Zipfian subword vocab for the frequency schedule "
+                        "at the cost of a ~50K-row embedding table.")
+    p.add_argument("--data-dir", default=DATA,
+                   help="output dir for train.bin/val.bin/meta.pkl (default data/). "
+                        "Use distinct dirs to keep char and BPE corpora side by side.")
     args = p.parse_args()
 
-    os.makedirs(DATA, exist_ok=True)
+    # Resolve relative --data-dir against the repo root (HERE), matching how
+    # train.py/eval.py/sample.py resolve cfg.data_dir via __file__, so a
+    # relative name like "data_char" points to the same place from any CWD.
+    data_out = args.data_dir if os.path.isabs(args.data_dir) else os.path.join(HERE, args.data_dir)
+    os.makedirs(data_out, exist_ok=True)
     # Dataset-specific cache filename. Using a single "input.txt" for both
     # datasets means `prepare.py` then `prepare.py --dataset tinystories`
     # silently reuses the Shakespeare file — a real bug found in clean-room
     # testing. Separate names let each dataset cache independently.
-    input_path = os.path.join(DATA, f"input_{args.dataset}.txt")
+    input_path = os.path.join(data_out, f"input_{args.dataset}.txt")
 
     if not os.path.exists(input_path) or os.path.getsize(input_path) < 1000:
         if args.dataset == "shakespeare":
@@ -109,25 +120,40 @@ def main():
         text = f.read()
     print(f"corpus length: {len(text):,} chars")
 
-    chars = sorted(set(text))
-    vocab_size = len(chars)
-    stoi = {c: i for i, c in enumerate(chars)}
-    itos = {i: c for i, c in enumerate(chars)}
-    print(f"vocab size: {vocab_size}")
-    if vocab_size > 256:
-        # uint16 still fits up to 65535; flag anyway because it's unusual.
-        print(f"warning: vocab_size={vocab_size} is large for char-level "
-              f"(unicode in the corpus?). Stored as uint16.")
+    if args.tokenizer == "char":
+        chars = sorted(set(text))
+        vocab_size = len(chars)
+        stoi = {c: i for i, c in enumerate(chars)}
+        itos = {i: c for i, c in enumerate(chars)}
+        print(f"vocab size: {vocab_size}")
+        if vocab_size > 256:
+            # uint16 still fits up to 65535; flag anyway because it's unusual.
+            print(f"warning: vocab_size={vocab_size} is large for char-level "
+                  f"(unicode in the corpus?). Stored as uint16.")
+        ids = np.array([stoi[c] for c in text], dtype=np.uint16)
+    else:  # gpt2 BPE
+        import tiktoken
+        enc = tiktoken.get_encoding("gpt2")
+        vocab_size = enc.n_vocab                       # 50257
+        assert vocab_size < 2 ** 16, "vocab exceeds uint16"
+        print(f"tokenizing {len(text):,} chars with gpt2 BPE...")
+        ids = np.array(enc.encode_ordinary(text), dtype=np.uint16)
+        # itos maps id -> decoded text piece (bytes -> utf-8, replacing partial
+        # multibyte tokens) so sample.py can still print readable strings.
+        itos = {i: enc.decode_single_token_bytes(i).decode("utf-8", errors="replace")
+                for i in range(vocab_size)}
+        stoi = None                                    # not needed at train time
+        print(f"vocab size: {vocab_size} (gpt2 BPE)   "
+              f"compression: {len(text) / len(ids):.2f} chars/token")
 
-    n = len(text)
-    train_text, val_text = text[: int(n * 0.9)], text[int(n * 0.9):]
-    train_ids = np.array([stoi[c] for c in train_text], dtype=np.uint16)
-    val_ids = np.array([stoi[c] for c in val_text], dtype=np.uint16)
-    train_ids.tofile(os.path.join(DATA, "train.bin"))
-    val_ids.tofile(os.path.join(DATA, "val.bin"))
-    with open(os.path.join(DATA, "meta.pkl"), "wb") as f:
+    n = len(ids)
+    train_ids = ids[: int(n * 0.9)]
+    val_ids = ids[int(n * 0.9):]
+    train_ids.tofile(os.path.join(data_out, "train.bin"))
+    val_ids.tofile(os.path.join(data_out, "val.bin"))
+    with open(os.path.join(data_out, "meta.pkl"), "wb") as f:
         pickle.dump({"vocab_size": vocab_size, "stoi": stoi, "itos": itos,
-                     "dataset": args.dataset}, f)
+                     "dataset": args.dataset, "tokenizer": args.tokenizer}, f)
     print(f"train: {len(train_ids):,} tokens   val: {len(val_ids):,} tokens")
 
 

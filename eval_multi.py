@@ -32,7 +32,7 @@ def parse_table(text: str):
         if line.startswith("| Metric | MDM | AR |"):
             section = "headline"
             continue
-        if line.startswith("| Schedule | PPL under AR"):
+        if "schedule | PPL under AR" in line.lower():
             section = "sched"
             continue
         if line.startswith("| Block setup |"):

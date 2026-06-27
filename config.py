@@ -36,7 +36,26 @@ class Config:
     sample_interval: int = 2000
 
     # diffusion
-    eps: float = 1e-3             # min mask ratio to avoid 1/t blowup
+    eps: float = 1e-3             # min mask ratio to avoid 1/t blowup (low-t clamp)
+    eps_hi: float = 1e-4          # high-t clamp 1-eps_hi for the per-token weight;
+                                  # smaller than eps so small-c tokens keep more of
+                                  # their high-noise supervision (tail of the
+                                  # equal-weight invariant). Only used by the
+                                  # frequency schedule, not the uniform baseline.
+
+    # frequency-weighted (Zipf) masking schedule. See schedule.py.
+    #   uniform        -> vanilla MDLM, every token masked with prob t
+    #   rare_first     -> rare tokens absorbed first (spectral analog)
+    #   frequent_first -> frequent tokens absorbed first (rare/content survive)
+    # zipf_beta is the strength; 0.0 collapses every schedule back to uniform.
+    schedule: str = "uniform"
+    zipf_beta: float = 2.0
+    # Controls (resolve_exponents precedence: match_noise > const_exp > schedule):
+    #   const_exp>0   -> every token gets this fixed exponent (no ordering)
+    #   match_noise   -> constant exponent auto-tuned to match that arm's mean
+    #                    corpus mask rate; the "was it ordering or just noise?" control
+    const_exp: float = 0.0
+    match_noise: str = ""
 
     # DUO-style hybrid training (Sahoo et al. 2024, "Diffusion Forcing for
     # Discrete Tokens"). With probability p_ar_mix per batch, replace the

@@ -4,6 +4,10 @@ __pycache__/
 data/*.bin
 data/*.pkl
 data/input*.txt
+# experiment corpora + run outputs (regenerable)
+data_*/
+runs/
 out/
 *.pt
+*.bin
 .DS_Store
